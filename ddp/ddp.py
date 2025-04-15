@@ -72,3 +72,9 @@ if __name__=="__main__":
     args.num_epochs=100
     # os['NCCL_IB_DISABLE']='1'
     train(args)
+
+"""
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --nnodes=2 --node_rank=0 --master_addr=10.82.1.225 --master_port=19500 ddp.py 
+
+"""

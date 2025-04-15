@@ -7,9 +7,11 @@
 ## 目录
 1. [MapReduce Theory](#1)
 1. [DP](#2) 
-1. [ddp](#3)
-1. [DeepSpeed](#4)
-1. [FSDP](#5)
+1. [DDP](#3)
+1. [Pipeline Parallelism](#4)
+1. [Tensor Parallelism](#5)
+1. [FSDP](#6)
+1. [DeepSpeed](#7)
 
 <a id=1>
 
@@ -19,6 +21,26 @@
 
 <details>
 <summary></summary>
+
+### 1.1 MapReduce
+
+![alt text](icon/image-6.png)
+
+### 1.2 通信原语
+![alt text](icon/image-7.png)
+
+* broadcast
+![alt text](icon/image-9.png)
+* scatter
+![alt text](icon/image-11.png)
+* gather
+![alt text](icon/image-12.png)
+* reduce
+![alt text](icon/image-13.png)
+* all-gather
+![alt text](icon/image-14.png)
+* all-reduce
+![alt text](icon/image-15.png)
 </details>
 
 <a id=2 >
@@ -30,85 +52,87 @@
 <details>
 <summary></summary>
 
-* **模型加载流程**  
+### 2.1 模型加载流程
 duplicate --> scatter --> parallel_apply --> gather  
 Note: 模型分布以后，权重并非叶子节点
 
-    <details>
-    <summary><i>python code</i></summary>
-    
-    ```python
-    import torch
-    from torch import nn
-    class model(nn.Module):
-        def __init__(self):
-            super(model,self).__init__()
-            self.l1=nn.Linear(1000,1000)
-            self.l2=nn.Linear(1000,1)
-            for p in self.l1.parameters():
-                nn.init.ones_(p)
-            for p in self.l2.parameters():
-                nn.init.ones_(p)
-        def forward(self,x):
-            return self.l2(self.l1(x))
-    '''
-    def replicate(
-        network: T,
-        devices: Sequence[Union[int, torch.device]],
-        detach: bool = False,
-    ) -> List[T]:
-    detach=False 表示训练过程共享梯度
-    '''
-    replicas = nn.parallel.replicate(model().to('cuda:2'), devices=[2, 3, 4],detach=False)
-    '''
-    r"""Slice tensors into approximately equal chunks and distributes them across given GPUs.
+<details>
+<summary><i>python code</i></summary>
 
-    Duplicates references to objects that are not tensors.
-    """
-    '''
-    x=torch.randn(6, 1000)
-    inputs = nn.parallel.scatter(x,target_gpus=[2, 3, 4],dim=0)
-    '''
-    r"""Apply each `module` in :attr:`modules` in parallel on each of :attr:`devices`.
+```python
+import torch
+from torch import nn
+class model(nn.Module):
+    def __init__(self):
+        super(model,self).__init__()
+        self.l1=nn.Linear(1000,1000)
+        self.l2=nn.Linear(1000,1)
+        for p in self.l1.parameters():
+            nn.init.ones_(p)
+        for p in self.l2.parameters():
+            nn.init.ones_(p)
+    def forward(self,x):
+        return self.l2(self.l1(x))
+'''
+def replicate(
+    network: T,
+    devices: Sequence[Union[int, torch.device]],
+    detach: bool = False,
+) -> List[T]:
+detach=False 表示训练过程共享梯度
+'''
+replicas = nn.parallel.replicate(model().to('cuda:2'), devices=[2, 3, 4],detach=False)
+'''
+r"""Slice tensors into approximately equal chunks and distributes them across given GPUs.
 
-    '''
-    outputs = nn.parallel.parallel_apply(replicas, inputs)
-    '''
-    r"""Gathers tensors from multiple GPU devices.
-    '''
-    result = nn.parallel.gather(outputs, target_device=2)
-    replicas[0].l1.weight.retain_grad()  # 显式保留梯度
-    replicas[1].l1.weight.retain_grad()  # 显式保留梯度
-    replicas[2].l1.weight.retain_grad()  # 显式保留梯度
-    m=model()
-    m(x).sum().backward()
-    result.sum().backward()
+Duplicates references to objects that are not tensors.
+"""
+'''
+x=torch.randn(6, 1000)
+inputs = nn.parallel.scatter(x,target_gpus=[2, 3, 4],dim=0)
+'''
+r"""Apply each `module` in :attr:`modules` in parallel on each of :attr:`devices`.
 
-    '''
-    print(m.l1.weight.grad[0][0]) #tensor(-6.6305)
-    print(replicas[0].l1.weight.grad[0][0]) #tensor(-2.4735, device='cuda:2')
-    print(replicas[1].l1.weight.grad[0][0]) #tensor(-0.8349, device='cuda:3')
-    print(replicas[2].l1.weight.grad[0][0]) #tensor(-3.3222, device='cuda:4')
-    '''
-    ```
-    </details>
+'''
+outputs = nn.parallel.parallel_apply(replicas, inputs)
+'''
+r"""Gathers tensors from multiple GPU devices.
+'''
+result = nn.parallel.gather(outputs, target_device=2)
+replicas[0].l1.weight.retain_grad()  # 显式保留梯度
+replicas[1].l1.weight.retain_grad()  # 显式保留梯度
+replicas[2].l1.weight.retain_grad()  # 显式保留梯度
+m=model()
+m(x).sum().backward()
+result.sum().backward()
+
+'''
+print(m.l1.weight.grad[0][0]) #tensor(-6.6305)
+print(replicas[0].l1.weight.grad[0][0]) #tensor(-2.4735, device='cuda:2')
+print(replicas[1].l1.weight.grad[0][0]) #tensor(-0.8349, device='cuda:3')
+print(replicas[2].l1.weight.grad[0][0]) #tensor(-3.3222, device='cuda:4')
+'''
+```
+</details>
 
 
-* **数据加载流程**   
+### 2.2 数据加载流程
 `PyTorch` 中的 `Dataloader` 提供使用多个进程（通过 `num_workers` > 0 设置）从磁盘加载数据以及将多页数据从可分页内存到固定内存的能力（通过设置 `pin_memory` = True）  `分页内存->固定内存`   
 当 `pin_memory`=`True` 时，`PyTorch` 会将数据固定到 `CPU` 的内存中，确保每个批次的数据可以被直接传输到 `GPU`。然后，`PyTorch` 会通过 异步数据传输 将数据从 `CPU` 传输到 `GPU`，这样在数据传输期间，`CPU` 就可以继续执行其他操作（例如，加载下一个批次的数据），从而提高了数据处理的效率。
 ![alt text](icon/image.png)
-* **封装接口实现**
-    ```python
-    m = nn.DataParallel(model().to('cuda:2'),device_ids=[2,3,4])
-    output = m(torch.ones(6,1000))
-    ```
-    ![alt text](icon/image-1.png)
+
+### 2.3 封装接口实现
+```python
+m = nn.DataParallel(model().to('cuda:2'),device_ids=[2,3,4])
+output = m(torch.ones(6,1000))
+```
+![alt text](icon/image-1.png)
 主节点 GPU 执行 reduce 归约梯度操作，并将更新后的结果同步到从属 GPU     
 Note: 单进程多线程，python `GIL锁` 限制性能。
-* **DataParallel 缺点**   
+
+### 2.4 DataParallel 缺点  
 1. 冗余数据副本        
-  数据从主机复制到主GPU，然后将子集分散在其他GPU上
+数据从主机复制到主GPU，然后将子集分散在其他GPU上
 2. 在前向传播之前跨GPU进行模型复制     
 由于模型参数是在主GPU上更新的，因此模型必须在每次正向传递的开始时重新同步
 3. 每批的线程创建/销毁开销     
@@ -145,8 +169,10 @@ Note: 单进程多线程，python `GIL锁` 限制性能。
 6.  使用 `destory_process_group()` 销毁进程组
 
 ### 3.1 单机多卡训练
+#### 3.1.1 数据和模型定义
+
 <details>
-<summary>数据和模型定义</summary>
+<summary><i>python code</i></summary>
 
 ```python
 import torch
@@ -179,8 +205,9 @@ class dataset(torch.utils.data.Dataset):
 ```
 </details>
 
+#### 3.1.2 训练方式1-单机多卡高效分布式训练
 <details>
-<summary>训练方式1-单机多卡高效分布式训练</summary>
+<summary><i>python code</i></summary>
 
 ```python
 def train(rank,args):# rank 参数 由 torch.multiprocessing.spawn 自动分配，序号从可用的 GPU 编号中获取（0，1，2，3）
@@ -232,13 +259,15 @@ if __name__=="__main__":
     import  torch.multiprocessing as mp
     mp.spawn(train, args=(args,), nprocs=args.world_size)  # 启动进程
 ```
-说明：主节点因为同步原因会产生额外负载
-![alt text](icon/image-3.png)
 
 </details>
 
+说明：主节点因为同步原因会产生额外负载
+![alt text](icon/image-3.png)
+
+#### 3.1.3 训练方式2 - 单机多卡(多机多卡特例)
 <details>
-<summary>训练方式2 - 单机多卡(多机多卡特例)</summary>
+<summary><i>python code</i></summary>
 
 ```python
 def train(args):
@@ -522,38 +551,120 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 --nnodes=2 --node_rank=1 --
 # --local_rank=0,1  # 从属节点本地 GPU 编号
 ```
 
-<details>
-<summary>通信算法</summary>        
+### 3.3 通信算法
 
-常规通信      
+#### 3.3.1 常规通信      
 ![alt text](icon/image-4.png)
+> 传输时间计算
+数量 $\phi$, 传输带宽 $\beta$, GPU 数量 p
+$ t = \frac{2p\times\phi}{\beta}  $
 
-环形通信        
+#### 3.3.2 环形通信        
 ![alt text](icon/image-5.png)
 ![alt text](icon/image-10.png)
 ![alt text](icon/image-8.png)
 
-</details>
+> 传输时间计算
+参数量 $\phi$, 传输带宽 $\beta$, GPU 数量 p
+$ t = \frac{2(p-1)\times\phi}{p\times\beta}  $
+
 
 </details>
-
 
 <a id=4>
 
-## 4. DeepSpeed
+## 4. 模型并行 —— 流水线并行
 
 </a>
 
 <details>
 <summary></summary>
 
-info
+### 4.1 混合精度训练流程
+![alt text](icon/image-16.png)
+> 正向传播时（FWD），上一层 fp16 的激活值和 fp16 的参数参与了计算，得到这一层的 fp16 激活值
+> 反向传播时（BWD），本层的激活值和参数参与计算，得到 fp16 的梯度
+> 参数更新时，fp16 的梯度以及 fp32 的参数副本，momentum 和 variance 参与计算，最终算出更新后的 fp32 参数、momentum 和 variance ，然后将 fp32 的参数转化为 fp16 进行本层的参数更新
 
-</details>
+### 4.2 Gradient Checkpoint（Re-materialization）
+f represents activations of different layers
+b represents gradient of activations and parameters of different layers
+![alt text](icon/backprop.png)
+![alt text](icon/image-17.png)
+
+step 0 保留所有激活，一次计算所有梯度，然后全部更新
+step 1 Vanilla backprop 
+![alt text](icon/output.gif)
+step 2 Memory poor backprop
+![alt text](icon/output_poor.gif)
+step 3 Checkpointed backprop
+![alt text](icon/output2.gif)
+> Trade off between computation time and memory usage
+![alt text](icon/image-20.png)
+```python
+from torch.utils.checkpoint import checkpoint
+checkpoint(fn,inputs)
+```
+
+### 4.3 流水线并行
+#### 4.3.1 Vanilla Pipeline
+![alt text](icon/image-18.png)
+仅相当于扩大显存，没有利用计算资源
+
+#### 4.3.2 MicroBatch Pipeline
+![alt text](icon/image-19.png)
+divide minibatch into microbatch
+
+#### 4.3.3 GPipe
+* Model spliting
+* MicroBatch Pipeline
+* Re-materialization
+![alt text](icon/image-21.png)
+
+
+#### 4.3.4 PipeDream
+>**F then B**
+![alt text](icon/image-23.png)
+Sync SGD
+$w^{t+1}=w^{t}-\lambda\cdot\nabla{f}(w_1^{t},w_2^{t},...,w_n^{t})$
+
+> **1F1B**
+![alt text](icon/image-22.png)
+Async SGD
+$w^{t+1}=w^{t}-\lambda\cdot\nabla{f}(w_1^{t-n+1},w_1^{t-n+2},...,w_n^{t})$
+![alt text](icon/image-24.png)
+通过保存参数备份，可以实现近似于 Data Parallelism 的效果，但是也会倍率放大模型的内存占用，具体倍率和备份的参数量有关
+
+</details> 
 
 <a id=5>
 
-## 5. FSDP
+## 5. 模型并行 —— 张量并行（Megatron）
+
+</a>
+
+<details>
+<summary></summary>
+
+Transformer 架构切分单层
+![alt text](icon/tensor-parallelism.png)
+
+
+
+
+
+<details>
+<summary><i>python code</i></summary>
+
+```python
+
+```
+
+</details>
+
+</details>
+
+## 6. FSDP
 
 </a>
 
@@ -563,3 +674,27 @@ info
 info
 
 </details>
+
+
+## 7. DeepSpeed
+
+</a>
+
+<!-- <details>
+<summary></summary> -->
+
+### 7.1 Zero
+
+
+
+
+<details>
+<summary><i>python code</i></summary>
+
+```python
+
+```
+
+</details>
+
+<!-- </details> -->
