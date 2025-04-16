@@ -586,6 +586,11 @@ $ t = \frac{2(p-1)\times\phi}{p\times\beta}  $
 > 反向传播时（BWD），本层的激活值和参数参与计算，得到 fp16 的梯度
 > 参数更新时，fp16 的梯度以及 fp32 的参数副本，momentum 和 variance 参与计算，最终算出更新后的 fp32 参数、momentum 和 variance ，然后将 fp32 的参数转化为 fp16 进行本层的参数更新
 
+* 参数量计算
+![alt text](icon/image-26.png)
+
+
+
 ### 4.2 Gradient Checkpoint（Re-materialization）
 f represents activations of different layers
 b represents gradient of activations and parameters of different layers
@@ -605,6 +610,80 @@ step 3 Checkpointed backprop
 from torch.utils.checkpoint import checkpoint
 checkpoint(fn,inputs)
 ```
+<details>
+<summary><i>python code</i></summary>
+
+```python
+import torch
+import torch.nn as nn
+from torch.nn import Sequential
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from torch.optim import SGD,Adam
+from torch.utils.data import DataLoader, TensorDataset
+
+# 设置随机种子以保证复现
+torch.manual_seed(42)
+
+# 定义一个支持梯度检查点的模型
+class CheckpointMLP(nn.Module):
+    def __init__(self, input_dim=1000, hidden_dim=16384, output_dim=10):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        # 使用 checkpoint 只保存输入输出，节省内存
+        x = checkpoint(self._block1, x)
+        # x = self._block1(x)
+        x = self.fc3(x)
+        return x
+
+    def _block1(self, x):
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return x
+    
+def get_dummy_dataloader(batch_size=16384, input_dim=1000, num_samples=1000000):
+    X = torch.randn(num_samples, input_dim)
+    y = torch.randint(0, 10, (num_samples,))
+    dataset = TensorDataset(X, y)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+
+def train(model, dataloader, epochs=100, device="cuda:0"):
+    model.to(device)
+    optimizer = Adam(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch_x, batch_y in dataloader:
+            # print(batch_x.shape)
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+
+            optimizer.zero_grad()
+            logits = model(batch_x)
+            loss = criterion(logits, batch_y)
+            print(torch.cuda.memory_allocated() / 1024**2, "MB")
+            loss.backward()
+
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch + 1}, Loss: {total_loss:.4f}")
+
+
+if __name__ == "__main__":
+    model = CheckpointMLP()
+    dataloader = get_dummy_dataloader()
+    train(model, dataloader)
+
+```
+
+</details>
 
 ### 4.3 流水线并行
 #### 4.3.1 Vanilla Pipeline
@@ -683,9 +762,188 @@ info
 <!-- <details>
 <summary></summary> -->
 
-### 7.1 Zero
+### 7.1 Zero - Memory Optimizations Toward Training Trillion Parameter Models
+#### 7.1.1 内存消耗
+* Model States Memory
+优化器状态、梯度、模型参数
+* Residual States Memory
+激活值、buffer、内存碎片
+
+#### 7.1.2 Zero-DP (Optimizing Model State Memory)
+* zero 0 —— simple data parallel
+通信量 $\phi$ 
+![alt text](icon/image-27.png)
+* zero 1 —— $P_{os}$ Optimizer State Partitioning
+通信量 $2\phi$  
+Reduction $4\times$
+![alt text](icon/image-28.png)
+* zero 2 —— $P_{os+g}$ Optimizer State Partitioning + Gradient Partitioning 
+通信量 $2\phi$  
+Reduction $8\times$ 
+![alt text](icon/image-29.png)
+* zero 3 —— $P_{os+g+p}$ Optimizer State Partitioning + Gradient 
+Partitioning + Parameter Partitioning
+通信量 $3\phi$ 
+Reduction $\rightarrow\infin$
+Note: **Deepspeed 实现时不分区模型参数，只分区用于计算的参数，所以实际上还是DP。**
+![alt text](icon/image-25.png)
+
+#### 7.1.3 Zero-R (Optimizing Residual State Memory)
+* $P_a$:Partitioned Activation Checkpointing 
+梯度检查点分区
+
+* $C_B$:Constant Size Buffers
+使用恒定大小的缓冲区来避免临时缓冲区随着模型大小的增加而爆炸（eg. GradNorm）
+![alt text](icon/1.jpg)
+
+* $M_D$:Memory Defragmentation
+ZeRO does memory defragmentation on-the-fly by pre-allocating contiguous memory chunks for activation checkpoints and gradients, and copying them over to the pre-allocated memory as they are produced.
+![alt text](icon/2.jpg)
+
+#### 7.1.4 用法
+```bash
+pip install deepspeed
+conda install mpi4py  # 只能 conda 安装
+```
+* 单节点多CPU
+
+<details>
+<summary><i>python code</i></summary>
+
+```python
+import torch
+import torch.nn as nn
+from torch.nn import Sequential,ModuleList
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from torch.optim import SGD,Adam
+from torch.utils.data import DataLoader, TensorDataset
+import deepspeed
+import argparse
+
+# 配置文件 config.json
+
+class MLP(nn.Module):
+    def __init__(self, input_dim=1000, hidden_dim=4096, output_dim=10):  # 48 - 0.75B  96 - 1.5B 
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.m = ModuleList([nn.Linear(hidden_dim, hidden_dim) for i in range(48)])
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.criterion = nn.CrossEntropyLoss()
+    def forward(self, x, y): # 模型定义时直接返回损失
+        x = F.relu(self.fc1(x))
+        for i in range(len(self.m)):
+            x = F.relu(self.m[i](x))
+        x = self.fc2(x)
+        loss = self.criterion(x, y)
+        # print(x.shape)
+        return loss
+    
+def get_dummy_dataset(input_dim=1000, num_samples=100000):
+    X = torch.randn(num_samples, input_dim)
+    y = torch.randint(0, 10, (num_samples,))
+    dataset = TensorDataset(X, y)
+    return dataset
+
+# 训练函数
+def train(model, dataset, epochs=100, device="cuda:0"):
+
+    """    
+    inputs:
+    deepspeed.initialize(args=None,model: torch.nn.Module = None,
+               optimizer: Optional[Union[Optimizer, DeepSpeedOptimizerCallable]] = None,
+               model_parameters: Optional[torch.nn.Module] = None,
+               training_data: Optional[torch.utils.data.Dataset] = None,
+               lr_scheduler: Optional[Union[_LRScheduler, DeepSpeedSchedulerCallable]] = None,
+               distributed_port: int = TORCH_DISTRIBUTED_DEFAULT_PORT,
+               mpu=None,
+               dist_init_required: Optional[bool] = None,
+               collate_fn=None,
+               config=None,
+               mesh_param=None,
+               config_params=None)
+    outputs:
+    return_items = [
+        engine,
+        engine.optimizer,
+        engine.training_dataloader,
+        engine.lr_scheduler,
+    ]
+    """
+    # 使用方式 1.传args,设置args.deepspeed_config 为 config.json 2.直接传config,config = path or dict 3.传config_params,目前与config一致
+    model_engine, _, dataloader, _ = deepspeed.initialize(model=model, \
+                                                 training_data=dataset, \
+                                                 config="config.json" )
+    # 管理分布式训练环境 torch.distributed.init_process_group() 修改为 deepspeed.init_distributed() 不设置则 DeepSpeed 会在其 initialize 期间自动初始化分布式环境
+    # print(dir(model_engine))
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch_x,batch_y in dataloader:
+            batch_x = batch_x.to(model_engine.local_rank)
+            batch_y = batch_y.to(model_engine.local_rank)
+            if model_engine.fp16_enabled():
+                batch_x = batch_x.half()
+            if model_engine.bfloat16_enabled():
+                batch_x = batch_x.bfloat16()
+            print(batch_x.shape)
+            loss = model_engine(batch_x,batch_y)
+
+            print(torch.cuda.memory_allocated() / 1024**2, "MB")
+            
+            model_engine.backward(loss) # 必须提供优化器
+            model_engine.step()
+
+            total_loss += loss.item()
+            print(f"Batch Loss: {loss.item():.4f}")
+        print(f"Epoch {epoch + 1}, Loss: {total_loss:.4f}")
+
+if __name__ == "__main__":
+    model = MLP()
+    dataset = get_dummy_dataset()
+    train(model, dataset)
 
 
+```
+
+</details>
+
+```bash
+deepspeed --num_gpus=4 ds_123.py 
+```
+单卡
+![alt text](icon/image-31.png)
+zero 0 - DDP
+4 gpu
+![alt text](icon/image-30.png)
+zero 1
+4 gpu
+![alt text](icon/image-32.png)
+zero 2
+4 gpu
+![alt text](icon/image-33.png)
+zero 3
+4 gpu
+![alt text](icon/image-34.png)
+
+* 多节点多CPU
+
+```bash
+# 方式一 指定hostfile.txt文件
+# hostfile.txt
+# worker1 slots=4  # 机器1，4张GPU  (worker1 ssh主机名称)
+# worker2 slots=4  # 机器2，4张GPU
+deepspeed --hostfile=hostfile.txt \
+    --master_addr=worker1 \  # 主节点IP或主机名
+    --master_port=6001 \     # 主节点端口
+    train.py \
+    --deepspeed_config ds_config.json
+```
+
+```bash
+# 方式二 直接运行 
+deepspeed --num_nodes=2 --num_gpus=4 --node_rank =<n> --master_addr=<worker1> --master_port=<port> ds_123.py 
+```
+* 单节点单CPU
 
 
 <details>
@@ -696,5 +954,7 @@ info
 ```
 
 </details>
+
+
 
 <!-- </details> -->
