@@ -9,9 +9,9 @@
 1. [DP](#2) 
 1. [DDP](#3)
 1. [Pipeline Parallelism](#4)
-1. [Tensor Parallelism](#5)
 1. [FSDP](#6)
-1. [DeepSpeed](#7)
+1. [DeepSpeed](#6)
+1. [Tensor Parallelism](#7)
 
 <a id=1>
 
@@ -718,32 +718,7 @@ $w^{t+1}=w^{t}-\lambda\cdot\nabla{f}(w_1^{t-n+1},w_1^{t-n+2},...,w_n^{t})$
 
 <a id=5>
 
-## 5. 模型并行 —— 张量并行（Megatron）
-
-</a>
-
-<details>
-<summary></summary>
-
-Transformer 架构切分单层
-![alt text](icon/tensor-parallelism.png)
-
-
-
-
-
-<details>
-<summary><i>python code</i></summary>
-
-```python
-
-```
-
-</details>
-
-</details>
-
-## 6. FSDP
+## 5. FSDP
 
 </a>
 
@@ -754,22 +729,23 @@ info
 
 </details>
 
+<a id=6>
 
-## 7. DeepSpeed
+## 6. DeepSpeed
 
 </a>
 
-<!-- <details>
-<summary></summary> -->
+<details>
+<summary></summary>
 
-### 7.1 Zero - Memory Optimizations Toward Training Trillion Parameter Models
-#### 7.1.1 内存消耗
+### 6.1 Zero - Memory Optimizations Toward Training Trillion Parameter Models
+#### 6.1.1 内存消耗
 * Model States Memory
 优化器状态、梯度、模型参数
 * Residual States Memory
 激活值、buffer、内存碎片
 
-#### 7.1.2 Zero-DP (Optimizing Model State Memory)
+#### 6.1.2 Zero-DP (Optimizing Model State Memory)
 * zero 0 —— simple data parallel
 通信量 $\phi$ 
 ![alt text](icon/image-27.png)
@@ -788,7 +764,7 @@ Reduction $\rightarrow\infin$
 Note: **Deepspeed 实现时不分区模型参数，只分区用于计算的参数，所以实际上还是DP。**
 ![alt text](icon/image-25.png)
 
-#### 7.1.3 Zero-R (Optimizing Residual State Memory)
+#### 6.1.3 Zero-R (Optimizing Residual State Memory)
 * $P_a$:Partitioned Activation Checkpointing 
 梯度检查点分区
 
@@ -800,8 +776,9 @@ Note: **Deepspeed 实现时不分区模型参数，只分区用于计算的参�
 ZeRO does memory defragmentation on-the-fly by pre-allocating contiguous memory chunks for activation checkpoints and gradients, and copying them over to the pre-allocated memory as they are produced.
 ![alt text](icon/2.jpg)
 
-#### 7.1.4 用法
+#### 6.1.4 用法
 ```bash
+# torch版本 cuda版本 cudatoolkit版本要保持一致
 pip install deepspeed
 conda install mpi4py  # 只能 conda 安装
 ```
@@ -943,8 +920,137 @@ deepspeed --hostfile=hostfile.txt \
 # 方式二 直接运行 
 deepspeed --num_nodes=2 --num_gpus=4 --node_rank =<n> --master_addr=<worker1> --master_port=<port> ds_123.py 
 ```
-* 单节点单CPU
 
+
+<details>
+<summary><i>python code</i></summary>
+
+```python
+import torch
+import torch.nn as nn
+from torch.nn import Sequential,ModuleList
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from torch.optim import SGD,Adam
+from torch.utils.data import DataLoader, TensorDataset
+import deepspeed
+from deepspeed.ops.adam import DeepSpeedCPUAdam
+
+# 配置文件 config.json   cpu-offload 使用zero 1,2,3
+
+class MLP(nn.Module):
+    def __init__(self, input_dim=1000, hidden_dim=4096, output_dim=10): # 48 - 0.75B  96 - 1.5B   
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.m = ModuleList([nn.Linear(hidden_dim, hidden_dim) for i in range(96)])
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.criterion = nn.CrossEntropyLoss()
+    def forward(self, x, y): # 模型定义时直接返回损失
+        x = F.relu(self.fc1(x))
+        for i in range(len(self.m)):
+            x = F.relu(self.m[i](x))
+        x = self.fc2(x)
+        loss = self.criterion(x, y)
+        # print(x.shape)
+        return loss
+    
+def get_dummy_dataset(input_dim=1000, num_samples=100000):
+    X = torch.randn(num_samples, input_dim)
+    y = torch.randint(0, 10, (num_samples,))
+    dataset = TensorDataset(X, y)
+    return dataset
+
+# 训练函数
+def train(model, dataset, epochs=100, device="cuda:0"):
+
+    """    
+    inputs:
+    deepspeed.initialize(args=None,model: torch.nn.Module = None,
+               optimizer: Optional[Union[Optimizer, DeepSpeedOptimizerCallable]] = None,
+               model_parameters: Optional[torch.nn.Module] = None,
+               training_data: Optional[torch.utils.data.Dataset] = None,
+               lr_scheduler: Optional[Union[_LRScheduler, DeepSpeedSchedulerCallable]] = None,
+               distributed_port: int = TORCH_DISTRIBUTED_DEFAULT_PORT,
+               mpu=None,
+               dist_init_required: Optional[bool] = None,
+               collate_fn=None,
+               config=None,
+               mesh_param=None,
+               config_params=None)
+    outputs:
+    return_items = [
+        engine,
+        engine.optimizer,
+        engine.training_dataloader,
+        engine.lr_scheduler,
+    ]
+    """
+    # 使用方式 1.传args,设置args.deepspeed_config 为 config.json 2.直接传config,config = path or dict 3.传config_params,目前与config一致
+    model_engine, _ , dataloader, _ = deepspeed.initialize(model=model, \
+                                                 training_data=dataset, \
+                                                 config="config.json" )
+    # 管理分布式训练环境 torch.distributed.init_process_group() 修改为 deepspeed.init_distributed() 不设置则 DeepSpeed 会在其 initialize 期间自动初始化分布式环境
+    # print(dir(model_engine))
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch_x,batch_y in dataloader:
+            batch_x = batch_x.to(model_engine.local_rank)
+            batch_y = batch_y.to(model_engine.local_rank)
+            if model_engine.fp16_enabled():
+                batch_x = batch_x.half()
+            if model_engine.bfloat16_enabled():
+                batch_x = batch_x.bfloat16()
+            print(batch_x.shape)
+            loss = model_engine(batch_x,batch_y)
+
+            print(torch.cuda.memory_allocated() / 1024**2, "MB")
+            
+            model_engine.backward(loss) # 必须提供优化器
+            model_engine.step()
+
+            total_loss += loss.item()
+            print(f"Batch Loss: {loss.item():.4f}")
+        print(f"Epoch {epoch + 1}, Loss: {total_loss:.4f}")
+
+if __name__ == "__main__":
+    model = MLP()
+    dataset = get_dummy_dataset()
+    train(model, dataset)
+```
+
+</details>
+<a id = 10086>
+
+* 单节点单GPU 
+</a>
+
+```bash
+# 训练 1.5 B模型
+# 修改 config.json 文件   
+"zero_optimization": 
+{"stage": 2,
+} 
+为 
+"zero_optimization": 
+{"stage": 2,   
+"offload_optimizer": {"device": "cpu",}, 
+"offload_param": {"device": "cpu",},
+"contiguous_gradients": true,
+"overlap_comm": true
+}
+# 模型会自动将 Adam 优化器修改为在 CPU 上实现的 DeepSpeedCPUAdam，其速度比标准 PyTorch 实现快 5 倍到 7 倍。
+```
+
+### 6.2 ZeRO-Offload: Democratizing Billion-Scale Model Training
+### 6.2.1 方法
+![alt text](icon/image-35.png)
+![alt text](icon/image-36.png)
+### 6.2.2 用法
+详情见[click](#10086)
+
+
+### 6.3 ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning
+info
 
 <details>
 <summary><i>python code</i></summary>
@@ -955,6 +1061,29 @@ deepspeed --num_nodes=2 --num_gpus=4 --node_rank =<n> --master_addr=<worker1> --
 
 </details>
 
+</details>
 
+
+<a id=7>
+
+## 7. 模型并行 —— 张量并行（Megatron）
+
+</a>
+
+<!-- <details>
+<summary></summary> -->
+
+Transformer 架构切分单层
+![alt text](icon/tensor-parallelism.png)
+
+
+<details>
+<summary><i>python code</i></summary>
+
+```python
+
+```
+
+</details>
 
 <!-- </details> -->

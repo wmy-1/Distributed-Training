@@ -1,0 +1,71 @@
+{
+  // ================= 基础配置 =================
+  "train_batch_size":4096,          // 全局批量大小（所有GPU的总和）
+  "gradient_accumulation_steps": 1, // 梯度累积步数（模拟更大batch）
+  // "steps_per_print": 10,           // 每隔多少步打印一次日志
+  // "wall_clock_breakdown": false,   // 是否分析时间消耗（调试用）
+
+  // ================= 优化器配置 =================
+  "optimizer": {
+    "type": "Adam",                // 优化器类型（Adam/AdamW/SGD等）
+    "params": {
+      "lr": 1e-4,                  // 学习率
+      "betas": [0.9, 0.999],       // Adam的beta参数
+      "eps": 1e-8,                 // 数值稳定性项
+      "weight_decay": 0.01         // 权重衰减
+    }
+  },
+
+  // ================= 学习率调度器 =================
+  "scheduler": {
+    "type": "WarmupLR",           // 调度器类型
+    "params": {
+      "warmup_min_lr": 0,          // 初始学习率
+      "warmup_max_lr": 1e-4,       // 最大学习率
+      "warmup_num_steps": 1000     // warmup步数
+    }
+  },
+
+  // ================= ZeRO 优化（内存优化核心） =================
+  "zero_optimization": {
+    "stage": 2,                    // ZeRO阶段（0/1/2/3）
+    // "allgather_partitions": true,  // 在stage 3中启用
+    // "reduce_scatter": true,        // 在stage 3中启用
+    // "overlap_comm": true,          // 重叠通信和计算
+    // "contiguous_gradients": true,  // 梯度连续内存
+  },
+
+  // ================= 混合精度训练 =================  # 加速而不是节省存储
+  // "bf16"
+  "fp16": {
+    "enabled": true,               // 启用FP16训练
+    // "loss_scale_window": 1000,     // 动态loss scaling窗口
+    // "initial_scale_power": 16,     // 初始loss scale（2^16）
+    // "hysteresis": 2,               // 动态调整的容错步数
+    // "min_loss_scale": 1            // 最小loss scale
+  },
+
+  // // ================= 梯度裁剪 =================
+  // "gradient_clipping": 1.0,        // 梯度裁剪阈值
+
+  // // ================= 激活检查点（内存优化） =================
+  // "activation_checkpointing": {
+  //   "partition_activations": true, // 分割激活检查点（stage 3）
+  //   "contiguous_memory_optimization": true, // 连续内存优化
+  //   "cpu_checkpointing": true      // 将激活检查点卸载到CPU
+  // },
+
+  // // ================= 日志与监控 =================
+  // "tensorboard": {
+  //   "enabled": true,               // 启用TensorBoard
+  //   "output_path": "logs",         // 日志保存路径
+  //   "job_name": "mlp_1.3b"         // 任务名称
+  // },
+
+  // // ================= 通信后端 =================
+  // "communication_data_type": "fp16", // 通信数据类型（减少带宽）
+  // "sparse_gradients": false,       // 是否支持稀疏梯度
+
+  // // ================= 随机种子 =================
+  // "seed": 42                       // 全局随机种子
+}
